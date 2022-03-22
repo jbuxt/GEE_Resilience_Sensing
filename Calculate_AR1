@@ -11,7 +11,7 @@
 // 1: Generate visual mask of low vegetation pixels
 // 2: Download data - this may be useful for spatially averaging AR(1) values to generate time series
 
-///////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////
 
 // Step 1
 // Define dataset - here it is MODIS 16 day NDVI
