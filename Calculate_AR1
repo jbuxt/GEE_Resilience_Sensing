@@ -1,0 +1,233 @@
+// Steps:
+// 1: Import NDVI dataset
+// 2: Calculate a) monthly averages and b) multi-annual monthly averages
+// 3: Decycle by subtracting 2b from 2a
+// 4: Take moving average of decycled data
+// 5: Subtract moving average from decycled to remove trend
+// 6: Calculate sliding window AR1
+// 7: Calcuate Kendall tau of AR1
+
+// Additional Steps
+// 1: Generate visual mask of low vegetation pixels
+// 2: Download data - this may be useful for spatially averaging AR(1) values to generate time series
+
+///////////////////////////////////////////////////////////////////////
+
+// Step 1
+// Define dataset - here it is MODIS 16 day NDVI
+
+var dataset = ee.ImageCollection('MODIS/006/MOD13Q1')
+                  .filterDate('2001-01-01', '2020-12-31');
+var ndvi = dataset.select('NDVI');
+
+// Step 2a
+// Average by month
+
+// Set years and month
+var startYear = 2001;
+var endYear = 2020;
+var years = ee.List.sequence(startYear, endYear);
+var months = ee.List.sequence(1,12);
+
+// Calculate monthly average 
+var monthly_average = ee.ImageCollection(ee.FeatureCollection(years.map(function(y){
+  var yearCollection = ndvi.filter(ee.Filter.calendarRange(y, y, 'year'));
+  var byYear = ee.ImageCollection.fromImages(
+    months.map(function(m) {
+      var meanImage = yearCollection.filter(ee.Filter.calendarRange(m, m, 'month'))
+                  .reduce(ee.Reducer.mean()).divide(10000); 
+      var date = ee.Date.fromYMD(y, m, 1).format("YYYY_MM_dd");
+      return meanImage.set('system:time_start', ee.Date.fromYMD(y, m, 1));
+  }));
+  return byYear;
+})).flatten());
+
+
+Map.addLayer(monthly_average,{},'monthly_average',false)
+
+// Step 2b
+// Calculate multi-annual monthly average
+
+var months = ee.List.sequence(1, 12);
+
+var startDate = ee.Date('2001-01-01')
+
+// This will calculate one year of multi-annual monthly averages
+
+var seasonal_av = ee.ImageCollection.fromImages(
+      months.map(function (m) {
+        return ndvi.filter(ee.Filter.calendarRange(m, m, 'month'))
+                    .select(0).mean().divide(10000)
+                    .set('month', m)
+                    ;
+}));
+
+// We now need a time sereis of repeating seasonal_av to subtract from original monthly_average time series
+// First we convert it to a list in order to create a repeating series, then convert back to an image collection
+
+var seasonal_av_length = seasonal_av.size();
+var seasonal_av_list = seasonal_av.toList(seasonal_av_length)
+
+var nyears = 20;           // Number of years for repeated seasonal_av
+
+var seasonal_av_list_repeat = ee.List.repeat(seasonal_av_list,nyears)
+
+var seasonal_av_list_rep_flat = seasonal_av_list_repeat.flatten()    //This flattens nested lists
+
+var seasonal_av_ts = ee.ImageCollection(seasonal_av_list_rep_flat)
+
+
+// Step 3
+// Stack imagecollection into single-multi band image
+
+var monthly_average_bands = monthly_average.toBands()
+
+var seasonalav_ts_bands = seasonal_av_ts.toBands()
+
+// Subtract one from other t0 remove seasonal cycle
+
+var decycle = monthly_average_bands.subtract(seasonalav_ts_bands)
+
+
+// Convert  from image to imagecollection
+
+var bandNames = decycle.bandNames();
+
+var Decycle_collection = ee.ImageCollection.fromImages(bandNames.map(function(name){
+  name = ee.String(name);
+  // select one band and put into an image. You might need a specific cast and renaming of the bands
+  return decycle.select(name).toFloat();
+}));
+
+// Rename images in order for later functions and mappings to work
+
+var rename = function(image) {
+  return image.rename("NDVI");
+};
+
+Map.addLayer(Decycle_collection.map(rename),{color:'FFFFFF'},'Decycled Collection',false)
+
+// Step 4
+// Calculate moving averages using lists
+
+var length = Decycle_collection.size();
+var Decycle_collection_list = Decycle_collection.map(rename).toList(length)
+
+// Define the number of months for the moving average
+var nmonths = 25             
+
+var calculated_list = Decycle_collection_list.map(function(img) {
+    var index = Decycle_collection_list.indexOf(img)
+    img = ee.Image(img);
+    var nextIndex = ee.Algorithms.If(index.eq(0), index.add(nmonths), index.add(nmonths));
+    var previousImage = ee.ImageCollection(Decycle_collection_list.slice(index,nextIndex));
+    var change = previousImage.reduce(ee.Reducer.mean())
+                                      // .copyProperties(img)).rename("NDVI");
+    return change;
+})
+
+var sz1 = Decycle_collection_list.size()
+
+var mov_av_list = calculated_list.slice(0,sz1.subtract(nmonths).add(1))     // REMOVE END VALUES
+
+
+// Convert moving average list to an imagecollection
+var moving_average = ee.ImageCollection(mov_av_list)
+
+
+
+// Step 5
+// Caclulate time series residuas by subtracting moving average from decycled time series
+
+var mmonths = 12;
+
+var Decycled_resized = Decycle_collection_list.slice(mmonths,sz1.subtract(mmonths))
+
+var residuals_list = Decycled_resized.map(function(img) {
+  var index = Decycled_resized.indexOf(img)
+  var img = ee.Image(Decycled_resized.get(index))
+  return img.subtract(ee.Image(mov_av_list.get(index)))
+})
+
+var Residuals = ee.ImageCollection(residuals_list)
+// Map.addLayer(Residuals, {}, "Residuals",false)
+
+// Step 6
+// Calculate AR(1) Moving Window
+
+// /// This uses a window of length equal to half of the time series
+
+var sz = residuals_list.size()                                              // Define length of dataset
+var wl = sz.divide(2)
+
+// The following code takes each image and attaches the following image as a band
+// Then we create an imagecollection of all of these images and reduce them via Pearsons correlation
+// This will correlate the two bands in each image (i.e. that image and the following one) across a sliding window
+
+var calculated_list3 = residuals_list.map(function(img_3) {
+    var index_3 = residuals_list.indexOf(img_3).subtract(1)
+    img_3 = ee.Image(img_3);
+    var nextIndex_3 = ee.Algorithms.If(index_3.eq(0), index_3.add(1), index_3.add(1));
+    var current_image = ee.Image(residuals_list.get(index_3))
+    var nextImage_3 = ee.Image(residuals_list.get(nextIndex_3)).rename("NDVI_2");
+    return ee.Image.cat([current_image,nextImage_3])
+  })
+
+var offset_list = calculated_list3.slice(1,calculated_list3.length().add(1))
+var offset = ee.ImageCollection(offset_list)
+
+var calculated_list4 = offset_list.map(function(img_4) {
+    var index_4 = offset_list.indexOf(img_4)
+    img_4 = ee.Image(img_4);
+    var nextIndex_4 = ee.Algorithms.If(index_4.eq(0), index_4.add(wl), index_4.add(wl));
+    var timeseries = ee.ImageCollection(offset_list.slice(index_4,nextIndex_4))
+    var timeseries_collection = ee.ImageCollection(timeseries)
+  return timeseries.select(["NDVI","NDVI_2"]).reduce(ee.Reducer.pearsonsCorrelation())
+})
+
+var ar1_list = calculated_list4.slice(0,sz.subtract(wl))
+var moving_window_ar1 = ee.ImageCollection(ar1_list)
+
+// Calculate mean AR(1)
+var AR1_mean = moving_window_ar1.reduce(ee.Reducer.mean())
+
+Map.addLayer(AR1_mean.select("correlation_mean"), {palette: ['ffa201','ffffff','3f007d']}, 'AR1 mean')
+
+var AR1_mean_collection = ee.ImageCollection(AR1_mean)
+
+// Step 7
+// Calculate Kendall Tau AR(1)
+
+var Kendall_tau_ar1 = moving_window_ar1.select("correlation").reduce(ee.Reducer.kendallsCorrelation())
+
+var kendall_tau_ar1_value = ee.ImageCollection(Kendall_tau_ar1.select(["correlation_tau"]))
+
+var visParams = {
+  min: -1, max: 1, 
+  palette: ['2b83c3', 'FFFFFF','ca0020']
+};
+
+Map.addLayer(kendall_tau_ar1_value, visParams, 'AR1 Kendall tau')
+
+
+// Addtional Step 1:
+// Calculate mask for low veg pixels
+
+var mean_ndvi = ndvi.reduce(ee.Reducer.mean()).divide(10000)
+var veg_mean_threshold = mean_ndvi.gte(0.18)
+var mask = veg_mean_threshold.eq(0)
+var veg_max_threshold_masked = veg_mean_threshold.updateMask(mask)
+Map.addLayer(veg_max_threshold_masked,{palette: '808080'},'Low Vegetation Pixel Mask')
+
+
+// // Addtional Step 2:
+// // Source of code for this step: @fitoprincipe Github repositary
+// // The following code with can be used to download all images from an imagecollection
+// // This is useful to analyse AR(1) time series offline and to spatially aggregate data 
+
+// var batch = require('users/fitoprincipe/geetools:batch')
+
+// batch.Download.ImageCollection.toDrive(AR1_mean_collection, 'AR1 Mean',
+//                 {scale: 250, 
+//                 region: region, 
+//                 type: 'float'})
